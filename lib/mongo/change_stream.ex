@@ -31,6 +31,59 @@ defmodule Mongo.ChangeStream do
     end
   end
 
+  @doc """
+    Calls the GetCore-Command
+    See https://github.com/mongodb/specifications/blob/master/source/find_getmore_killcursors_commands.rst
+  """
+  def get_more(topology_pid, session, coll, cursor_id,
+        change_stream(resume_token: resume_token, op_time: op_time, cmd: aggregate_cmd,
+          on_resume_token: fun) = change_stream, opts) do
+
+    get_more = [
+                  getMore: %BSON.LongNumber{value: cursor_id},
+                  collection: coll,
+                  batchSize: opts[:batch_size],
+                  maxTimeMS: opts[:max_time]
+                ] |> filter_nils()
+
+    with {:ok, %{"operationTime" => op_time,
+                  "cursor" => %{"id" => new_cursor_id, "nextBatch" => docs} = cursor,
+                  "ok" => ok}} when ok == 1 <- Mongo.exec_command_session(session, get_more, opts) do
+
+      old_token = change_stream(change_stream, :resume_token)
+      change_stream = update_change_stream(change_stream, cursor["postBatchResumeToken"], op_time, List.last(docs))
+      new_token = change_stream(change_stream, :resume_token)
+
+      case token_changes(old_token, new_token) do
+        true  -> fun.(new_token)
+        false -> nil
+      end
+
+      {:ok, %{cursor_id: new_cursor_id, docs: docs, change_stream: change_stream}}
+
+    else
+      {:error, %Mongo.Error{resumable: false} = not_resumable} -> {:error, not_resumable}
+      {:error, _error} ->
+
+        with {:ok, wire_version} <- Mongo.wire_version(topology_pid) do
+
+          [%{"$changeStream" => stream_opts} | pipeline] = Keyword.get(aggregate_cmd, :pipeline) # extract the change stream options
+
+          stream_opts   = update_stream_options(stream_opts, resume_token, op_time, wire_version)
+          aggregate_cmd = Keyword.update!(aggregate_cmd, :pipeline, fn _ -> [%{"$changeStream" => stream_opts} | pipeline] end)
+
+          # kill the cursor
+          kill_cursors(session, coll, [cursor_id], opts)
+
+          # Start aggregation again...
+          with {:ok, state} <- aggregate(topology_pid, aggregate_cmd, fun, opts) do
+            {:resume, state}
+          end
+        end
+
+    end
+  end
+
   defimpl Enumerable do
 
     defrecordp :change_stream, [:resume_token, :op_time, :cmd, :on_resume_token]
